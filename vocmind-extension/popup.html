@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VocMind</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">V</div>
+        <div>
+          <div class="brand-title">VocMind</div>
+          <div class="brand-sub">Запись, разбор и история звонков</div>
+        </div>
+      </div>
+
+      <div class="status-pill" id="statusPill" data-state="idle">
+        <span class="status-dot"></span>
+        <span id="statusText">Готово</span>
+      </div>
+    </header>
+
+    <nav class="section-switcher" aria-label="Разделы расширения">
+      <button class="section-btn active" data-section="recording" type="button">
+        <span class="section-btn__icon">●</span>
+        <span>Запись</span>
+      </button>
+      <button class="section-btn" data-section="settings" type="button">
+        <span class="section-btn__icon">◌</span>
+        <span>Настройки</span>
+      </button>
+      <button class="section-btn" data-section="history" type="button">
+        <span class="section-btn__icon">◐</span>
+        <span>История звонков</span>
+      </button>
+    </nav>
+
+    <main class="sections">
+      <section class="section-page active" id="section-recording">
+        <div class="hero-card">
+          <div class="hero-card__top">
+            <div>
+              <div class="section-kicker">Запись встречи</div>
+              <h1 class="section-title" id="voiceTitle">Нажми, чтобы начать</h1>
+              <div class="section-sub" id="voiceSub">Запись идёт чанками примерно по 7 секунд</div>
+            </div>
+            <div class="mini-badge" id="recordModeBadge">mic</div>
+          </div>
+
+          <div class="orb-wrap">
+            <div class="halo"></div>
+            <div class="halo halo2"></div>
+
+            <button id="orbBtn" class="orb" aria-label="Начать запись" type="button">
+              <div class="orb-inner">
+                <div class="mic">
+                  <div class="mic-body"></div>
+                  <div class="mic-stem"></div>
+                  <div class="mic-base"></div>
+                </div>
+              </div>
+            </button>
+
+            <div class="sparkline" aria-hidden="true">
+              <span></span><span></span><span></span><span></span><span></span>
+              <span></span><span></span><span></span><span></span><span></span>
+            </div>
+          </div>
+
+          <div class="stats-grid">
+            <div class="stat-card">
+              <div class="stat-label">Статус</div>
+              <div class="stat-value" id="recordStatusCard">Ожидание</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Микрофон</div>
+              <div class="stat-value stat-value--small" id="recordMicCard">—</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Бэкенд</div>
+              <div class="stat-value stat-value--small" id="recordBackendCard">—</div>
+            </div>
+          </div>
+
+          <div class="action-row">
+            <button id="stopBtn" class="btn btn-secondary" disabled type="button">Стоп</button>
+            <button id="copyBtn" class="btn btn-primary" title="Скопировать протокол" type="button">Копировать протокол</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="tabs tabs--tight">
+            <button class="tab active" data-tab="protocol" type="button">Протокол</button>
+            <button class="tab" data-tab="live" type="button">Live</button>
+            <div class="tabs-right">
+              <button id="clearBtn" class="iconbtn" title="Очистить" type="button">✕</button>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div id="protocolView" class="view active">Пока нет данных.</div>
+            <div id="liveView" class="view">Пока нет подсказок.</div>
+          </div>
+
+          <div class="footer">
+            <span class="muted" id="sessionLine">Готово</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="section-page" id="section-settings">
+        <div class="card card-stack">
+          <div class="card-head">
+            <div>
+              <div class="section-kicker">Аудио</div>
+              <div class="card-title">Микрофон и запись</div>
+            </div>
+            <div class="mini-badge mini-badge--soft" id="settingsSavedBadge">Авто</div>
+          </div>
+
+          <div class="settings-group">
+            <div class="group-caption">Источник звука</div>
+            <div class="grid2">
+              <div class="field">
+                <label for="micSelect">Микрофон</label>
+                <select id="micSelect" class="input"></select>
+              </div>
+
+              <div class="field">
+                <label for="captureMode">Режим записи</label>
+                <select id="captureMode" class="input">
+                  <option value="mic">Только микрофон</option>
+                  <option value="tab_mic">Вкладка + микрофон</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-group">
+            <div class="group-caption">Уровень сигнала</div>
+            <div class="gain-card gain-card--settings">
+              <div class="gain-top">
+                <span class="gain-label">Mic Gain</span>
+                <span class="gain-val"><b id="gainVal">1.8</b>x</span>
+              </div>
+              <input id="gainSlider" class="gain-slider" type="range" min="0.5" max="5" step="0.1" value="1.8" />
+              <div class="hint-text">Подними усиление, если голос тихий. Слишком высокий уровень может давать перегруз.</div>
+            </div>
+          </div>
+
+          <div class="settings-group">
+            <div class="group-caption">Тест и самопрослушка</div>
+            <div class="audio-test-card">
+              <div class="audio-test-card__top">
+                <div>
+                  <div class="audio-test-card__title">Проверка микрофона в реальном времени</div>
+                  <div class="audio-test-card__sub">Нажми «Начать тест», чтобы услышать себя с текущим Mic Gain. Для проверки лучше использовать наушники.</div>
+                </div>
+                <div class="mini-badge mini-badge--soft" id="audioTestState">Выключено</div>
+              </div>
+
+              <div class="audio-meter" aria-hidden="true">
+                <div class="audio-meter__fill" id="audioMeterFill"></div>
+              </div>
+
+              <div class="action-row action-row--compact">
+                <button id="audioTestBtn" class="btn btn-primary" type="button">Начать тест</button>
+                <button id="audioTestStopBtn" class="btn btn-secondary" type="button" disabled>Остановить</button>
+              </div>
+
+              <div class="hint-text" id="audioTestHint">Прослушка выключена. В тесте используется выбранный микрофон и текущее усиление.</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card card-stack">
+          <div class="card-head">
+            <div>
+              <div class="section-kicker">Подключение</div>
+              <div class="card-title">Коннект с mini app</div>
+            </div>
+            <div class="mini-badge" id="accountBadge">Не подключено</div>
+          </div>
+
+          <div class="settings-group">
+            <div class="group-caption">Код привязки</div>
+            <div class="field">
+              <label for="linkCode">Код подключения</label>
+              <div class="inline-input-row">
+                <input id="linkCode" class="input" placeholder="Например: AB12CD34" />
+                <button id="copyLinkCodeBtn" class="btn btn-secondary btn-fit" type="button">Копировать</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="action-row action-row--stack-mobile">
+            <button id="connectBtn" class="btn btn-primary" type="button">Подключить расширение</button>
+            <button id="permissionsBtn" class="btn btn-secondary" type="button">Разрешения</button>
+          </div>
+        </div>
+
+        <div class="card card-stack">
+          <div class="card-head">
+            <div>
+              <div class="section-kicker">Аккаунт</div>
+              <div class="card-title">Подписка и лимиты</div>
+            </div>
+            <div class="mini-badge mini-badge--soft" id="accountStateBadge">Нет данных</div>
+          </div>
+
+          <div id="accountView" class="account-shell account-shell--empty">
+            <div class="account-empty">
+              <div class="account-empty__title">Расширение ещё не подключено</div>
+              <div class="account-empty__sub">Вставь код подключения и нажми «Подключить расширение», чтобы подтянуть тариф и лимиты.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section-page" id="section-history">
+        <div class="card card-stack">
+          <div class="card-head">
+            <div>
+              <div class="section-kicker">История звонков</div>
+              <div class="card-title">Последние записи</div>
+            </div>
+            <div class="history-summary" id="historySummary">0 звонков</div>
+          </div>
+
+          <div class="settings-group">
+            <div class="field">
+              <label for="historySearchInput">Поиск по встречам</label>
+              <div class="inline-input-row">
+                <input id="historySearchInput" class="input" placeholder="Название, тема, фрагмент текста" />
+                <button id="historySearchBtn" class="btn btn-secondary btn-fit" type="button">Найти</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="action-row action-row--compact history-actions-row">
+            <button id="refreshHistoryBtn" class="btn btn-secondary" type="button">Обновить</button>
+            <button id="clearHistoryBtn" class="btn btn-secondary" type="button">Очистить историю</button>
+          </div>
+
+          <div id="historyList" class="history-list"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

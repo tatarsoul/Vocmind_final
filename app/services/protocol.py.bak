@@ -1,0 +1,810 @@
+import json
+import re
+from difflib import SequenceMatcher
+from typing import Any, Dict, Iterable, List
+
+from ..config import settings
+from .groq import groq_chat_json
+
+NOISE_PATTERNS = [
+    r"\b(?:раз\s*,?\s*два\s*,?\s*три|test|тест|проверка звука|как меня слышно|слышно ли|hello[,! ]*vocmind|vocmind[,! ]*как меня слышно)\b",
+    r"\b(?:подписывайтесь на наш канал|подписывайтесь|всем пока|всем хорошей недели|продуктивной недели|спасибо за просмотр)\b",
+    r"^[а-яa-zё]{1,3}\.{2,}$",
+]
+IDEA_MARKERS = ["идея", "предлагаю", "можно", "давайте", "вариант", "гипотез", "попробовать", "стоит попробовать"]
+DECISION_MARKERS = ["решили", "договорились", "согласовали", "согласовано", "принято решение", "утвердили", "будем делать"]
+RISK_MARKERS = ["риск", "риски", "проблем", "блокер", "мешает", "непонятно", "неясно", "может сорваться", "может не получиться", "ограничение"]
+NEXT_STEP_MARKERS = ["после чего", "далее", "затем", "потом", "next step", "and after that", "after that"]
+TASK_MARKERS = [
+    "нужно", "надо", "необходимо", "требуется", "следует", "задача", "сделать", "дописать", "написать", "начать",
+    "подготовить", "проверить", "доработать", "исправить", "привести", "закончить", "доделать", "переделать",
+    "обновить", "добавить", "убрать", "переписать", "оформить", "запустить", "собрать",
+]
+TASK_VERBS = [
+    "дописать", "написать", "начать", "сделать", "подготовить", "проверить", "доработать", "исправить", "привести",
+    "закончить", "доделать", "переделать", "обновить", "добавить", "убрать", "переписать", "оформить", "запустить", "собрать",
+]
+COMPOUND_TASK_RE = re.compile(
+    r",\s*(?=(?:сделать|написать|начать|подготовить|проверить|доработать|исправить|привести|закончить|доделать|переделать|обновить|добавить|убрать|переписать|оформить|запустить|собрать)\b)",
+    flags=re.I,
+)
+
+
+def _coerce_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        parts = []
+        for key in ("task", "text", "title", "detail", "name", "value"):
+            v = value.get(key)
+            if isinstance(v, str) and v.strip():
+                parts.append(v.strip())
+        return " — ".join(parts[:2]).strip()
+    return str(value).strip()
+
+
+def _norm_text(text: str) -> str:
+    t = _coerce_text(text).lower().replace("ё", "е")
+    t = re.sub(r"^[=:\-\s]+|[=:\-\s]+$", "", t)
+    t = re.sub(r"[^\w\s]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _contains_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+
+def _has_weird_script_mix(text: str) -> bool:
+    t = text or ""
+    has_cyr = bool(re.search(r"[А-Яа-яЁё]", t))
+    has_lat = bool(re.search(r"[A-Za-z]", t))
+    return _contains_cjk(t) or (has_cyr and has_lat and "after that" in t.lower() and len(t.split()) <= 10)
+
+
+def _is_noise_line(text: str) -> bool:
+    t = _coerce_text(text)
+    if not t:
+        return True
+    low = t.lower().strip()
+    if _has_weird_script_mix(t):
+        return True
+    if re.fullmatch(r"[\d\s,.:;!?#%+\-/]+", t):
+        return True
+    if re.fullmatch(r"(.)\1{5,}", low):
+        return True
+    for pat in NOISE_PATTERNS:
+        if re.search(pat, low):
+            return True
+    words = low.split()
+    if len(words) >= 5 and len(set(words)) <= max(1, len(words) // 4):
+        return True
+    return False
+
+
+def _sentence_cleanup(text: str) -> str:
+    t = _coerce_text(text)
+    if not t:
+        return ""
+    t = re.sub(r"^(?:ME|THEM|SPEAKER)\s*:\s*", "", t, flags=re.I)
+    t = re.sub(r"^===.*?===\s*", "", t)
+    t = t.replace("—", "-").replace("–", "-")
+    t = re.sub(r"^(?:ну и|ну|так|точнее)\s+", "", t, flags=re.I)
+    t = re.sub(r"\bантипугиатом\b", "антиплагиатом", t, flags=re.I)
+    t = re.sub(r"\bне париться антиплагиатом\b", "привести текст в вид, чтобы антиплагиат не срабатывал", t, flags=re.I)
+    t = re.sub(r"\bпроизводим все необходимые диаграммы\b", "сделать все необходимые диаграммы", t, flags=re.I)
+    t = re.sub(r"\bзаписать приложение, чтобы оно работало корректно\b", "дописать приложение, чтобы оно работало корректно", t, flags=re.I)
+    t = re.sub(r"(?i)(дописать приложение[^,]*),\s*после\s+\1,\s*после\s+чего", r"\1, после чего", t)
+    t = re.sub(r"(?i)(начать писать вторую главу[^,]*),\s*после\s+\1", r"\1", t)
+    t = re.sub(r"\bstart writing the third chapter\b", "начать писать третью главу", t, flags=re.I)
+    t = re.sub(r"\bstart writing the second chapter\b", "начать писать вторую главу", t, flags=re.I)
+    t = re.sub(r"\bwrite the third chapter\b", "написать третью главу", t, flags=re.I)
+    t = re.sub(r"\bwrite the second chapter\b", "написать вторую главу", t, flags=re.I)
+    t = re.sub(r"\bapp\b", "приложение", t, flags=re.I)
+    t = re.sub(r"\s+", " ", t).strip(" .,-")
+    if t:
+        t = t[0].upper() + t[1:]
+    return t
+
+
+def _split_sentences(text: str) -> List[str]:
+    src = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    units: List[str] = []
+    buf = ""
+    for line in src.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("==="):
+            continue
+        line = re.sub(r"^(?:ME|THEM|SPEAKER)\s*:\s*", "", line, flags=re.I).strip()
+        if not line:
+            continue
+        buf = (buf + " " + line).strip() if buf else line
+        if re.search(r"[.!?…]$", line):
+            units.append(buf)
+            buf = ""
+    if buf:
+        units.append(buf)
+
+    out: List[str] = []
+    for unit in units:
+        for part in re.split(r"(?<=[.!?])\s+", unit):
+            cleaned = _sentence_cleanup(part)
+            if cleaned and not _is_noise_line(cleaned):
+                out.append(cleaned)
+    return out
+
+
+def _sim(a: str, b: str) -> float:
+    return SequenceMatcher(None, _norm_text(a), _norm_text(b)).ratio()
+
+
+def _dedupe_texts(items: Iterable[str], *, strong: bool = False) -> List[str]:
+    out: List[str] = []
+    for item in items:
+        t = _sentence_cleanup(item)
+        if not t or _is_noise_line(t):
+            continue
+        n = _norm_text(t)
+        if not n:
+            continue
+        duplicate = False
+        for prev in out[-12:]:
+            pn = _norm_text(prev)
+            if not pn:
+                continue
+            ratio = _sim(t, prev)
+            if n == pn or n in pn or pn in n or ratio >= (0.84 if strong else 0.90):
+                duplicate = True
+                break
+        if not duplicate:
+            out.append(t)
+    return out
+
+
+def _extract_task_text(text: str) -> str:
+    t = _sentence_cleanup(text)
+    if not t:
+        return ""
+    low = t.lower()
+    for marker in ["после чего", "далее", "затем", "потом", "and after that", "after that", "итак", "задача на неделю", "задачи на неделю", "обсудим задачи на следующей неделе"]:
+        if low.startswith(marker):
+            t = _sentence_cleanup(t[len(marker):])
+            low = t.lower()
+    for marker in ["необходимо", "нужно", "надо", "следует", "требуется"]:
+        if low.startswith(marker + " "):
+            t = _sentence_cleanup(t[len(marker):])
+            low = t.lower()
+    for verb in TASK_VERBS:
+        m = re.search(rf"\b{verb}\b.+", low)
+        if m:
+            t = _sentence_cleanup(t[m.start():])
+            break
+    t = re.sub(r"\bв вид,?\s+чтобы\b", "в вид, чтобы", t, flags=re.I)
+    t = re.sub(r"^Начать\s+(вторую|третью)\s+главу\s+писать$", r"Начать писать \1 главу", t, flags=re.I)
+    t = re.sub(r"^Начать\s+(вторую|третью)\s+главу\s+писать", r"Начать писать \1 главу", t, flags=re.I)
+    t = re.sub(r"\bего не видел\b", "не срабатывал", t, flags=re.I)
+    t = re.sub(r"(?i)(дописать приложение[^,]*),?\s*после\s+дописать приложение[^,]*", r"\1", t)
+    t = re.sub(r"(?i)^(.+?),\s*после\s+\1,", r"\1,", t)
+    if re.search(r"(?i)^дописать приложение.*?,\s*после\s+дописать приложение\b", t):
+        t = re.split(r"(?i),\s*после\s+дописать приложение\b", t, maxsplit=1)[0]
+    t = re.sub(r"\bне парился антиплагиатом\b", "антиплагиат не срабатывал", t, flags=re.I)
+    t = re.sub(r",?\s*после$", "", t, flags=re.I)
+    return t.strip(" .")
+
+
+def _split_compound_task(text: str) -> List[str]:
+    task = _extract_task_text(text)
+    if not task:
+        return []
+    parts = COMPOUND_TASK_RE.split(task)
+    return [_sentence_cleanup(part) for part in parts if _sentence_cleanup(part)]
+
+
+def _build_summary(tasks: List[str], decisions: List[str], next_steps: List[str]) -> str | None:
+    core = _dedupe_texts(decisions[:1] + tasks[:2] + next_steps[:1], strong=True)
+    if not core:
+        return None
+    intro = "Обсудили рабочие задачи и ближайшие шаги."
+    tail = "; ".join(x[0].lower() + x[1:] if x else x for x in core[:3])
+    return f"{intro} Зафиксировали, что нужно {tail}." if tail else intro
+
+
+def protocol_from_transcript(transcript_text: str) -> Dict[str, Any]:
+    sentences = _split_sentences(transcript_text)
+    tasks: List[str] = []
+    next_steps: List[str] = []
+    decisions: List[str] = []
+    ideas: List[str] = []
+    risks: List[str] = []
+    current_subject = ""
+
+    for sentence in sentences:
+        low = sentence.lower()
+        if "вторую главу" in low:
+            current_subject = "вторую главу"
+        elif "третью главу" in low:
+            current_subject = "третью главу"
+
+        if _is_noise_line(sentence):
+            continue
+        if any(m in low for m in IDEA_MARKERS):
+            ideas.extend(_split_compound_task(sentence) or [sentence])
+            continue
+        if any(m in low for m in RISK_MARKERS):
+            risks.append(sentence)
+            continue
+        if any(m in low for m in DECISION_MARKERS):
+            decisions.append(sentence)
+            continue
+
+        starts_as_next = any(low.startswith(m) for m in NEXT_STEP_MARKERS)
+        middle_next = re.search(r"\b(?:после чего|далее|затем|потом|and after that|after that)\b", low)
+        is_task = any(m in low for m in TASK_MARKERS) or bool(middle_next)
+        if is_task:
+            task_groups: List[tuple[str, bool]] = []
+            if starts_as_next:
+                task_groups.append((sentence, True))
+            elif middle_next:
+                idx = middle_next.start()
+                before = sentence[:idx].strip(' ,')
+                after = sentence[idx:].strip(' ,')
+                if before:
+                    task_groups.append((before, False))
+                if after:
+                    task_groups.append((after, True))
+            else:
+                task_groups.append((sentence, False))
+
+            for piece, send_to_next in task_groups:
+                task_parts = _split_compound_task(piece)
+                fixed_parts: List[str] = []
+                for task in task_parts:
+                    if current_subject and re.search(r"\bее\b", task.lower()):
+                        task = re.sub(r"\bее\b", current_subject, task, flags=re.I)
+                    if current_subject and task.lower().startswith("начать писать") and current_subject not in task.lower():
+                        task = f"Начать писать {current_subject}"
+                    fixed_parts.append(task)
+                if send_to_next:
+                    next_steps.extend(fixed_parts)
+                else:
+                    tasks.extend(fixed_parts)
+
+    tasks = _dedupe_texts(tasks, strong=True)
+    next_steps = _dedupe_texts(next_steps, strong=True)
+    decisions = _dedupe_texts(decisions, strong=True)
+    ideas = _dedupe_texts(ideas, strong=True)
+    risks = _dedupe_texts(risks, strong=True)
+
+    tasks = [
+        task for task in tasks
+        if all(_sim(task, other) < 0.84 and _norm_text(task) not in _norm_text(other) and _norm_text(other) not in _norm_text(task)
+               for other in next_steps + decisions)
+    ]
+
+    action_items = [{"task": task, "assignee": None, "due": None} for task in tasks]
+    summary = _build_summary(tasks, decisions, next_steps)
+    return {
+        "summary": summary,
+        "topics": [],
+        "decisions": decisions,
+        "action_items": action_items,
+        "ideas": ideas,
+        "risks": risks,
+        "next_steps": next_steps,
+        "notes": None,
+    }
+
+
+def normalize_protocol_state(state: Dict[str, Any] | None, transcript_text: str = "") -> Dict[str, Any]:
+    src = dict(state or {})
+    base = protocol_from_transcript(transcript_text) if transcript_text else {
+        "summary": None,
+        "topics": [],
+        "decisions": [],
+        "action_items": [],
+        "ideas": [],
+        "risks": [],
+        "next_steps": [],
+        "notes": None,
+    }
+
+    def clean_list(items: Any) -> List[str]:
+        result: List[str] = []
+        if isinstance(items, list):
+            for item in items:
+                txt = _sentence_cleanup(_coerce_text(item))
+                if txt and not _is_noise_line(txt):
+                    result.append(txt)
+        return _dedupe_texts(result, strong=True)
+
+    def clean_actions(items: Any) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict):
+                    task = _extract_task_text(_coerce_text(item.get("task")))
+                    assignee = _coerce_text(item.get("assignee")) or None
+                    due = _coerce_text(item.get("due")) or None
+                else:
+                    task = _extract_task_text(_coerce_text(item))
+                    assignee = None
+                    due = None
+                if task and not _is_noise_line(task):
+                    result.append({"task": task, "assignee": assignee, "due": due})
+        out: List[Dict[str, Any]] = []
+        for item in result:
+            if any(_sim(item["task"], prev["task"]) >= 0.84 or _norm_text(item["task"]) in _norm_text(prev["task"]) or _norm_text(prev["task"]) in _norm_text(item["task"]) for prev in out):
+                continue
+            out.append(item)
+        return out
+
+    summary = _sentence_cleanup(_coerce_text(src.get("summary")))
+    if _is_noise_line(summary):
+        summary = ""
+
+    topics = clean_list(src.get("topics"))
+    decisions = clean_list(src.get("decisions"))
+    action_items = clean_actions(src.get("action_items"))
+    ideas = clean_list(src.get("ideas"))
+    risks = clean_list(src.get("risks"))
+    next_steps = clean_list(src.get("next_steps"))
+    notes = _sentence_cleanup(_coerce_text(src.get("notes")))
+    if _is_noise_line(notes):
+        notes = ""
+
+    if base["decisions"]:
+        decisions = _dedupe_texts(base["decisions"] + decisions, strong=True)
+    if base["action_items"]:
+        action_items = clean_actions(base["action_items"] + action_items)
+    if base["next_steps"]:
+        next_steps = _dedupe_texts(base["next_steps"] + next_steps, strong=True)
+    if base["risks"]:
+        risks = _dedupe_texts(base["risks"] + risks, strong=True)
+    if base["ideas"]:
+        ideas = _dedupe_texts(base["ideas"] + ideas, strong=True)
+
+    if not base["ideas"]:
+        ideas = []
+    if not base["decisions"]:
+        decisions = []
+    if not base["risks"]:
+        risks = []
+
+    next_steps = [x for x in next_steps if all(_sim(x, a["task"]) < 0.84 for a in action_items)]
+    decisions = [x for x in decisions if all(_sim(x, a["task"]) < 0.84 for a in action_items)]
+
+    if not summary:
+        summary = base["summary"]
+
+    return {
+        "summary": summary or None,
+        "topics": topics,
+        "decisions": decisions,
+        "action_items": action_items,
+        "ideas": ideas,
+        "risks": risks,
+        "next_steps": next_steps,
+        "notes": notes or None,
+    }
+
+
+def searchable_protocol_strings(state: Dict[str, Any] | None) -> List[str]:
+    p = normalize_protocol_state(state)
+    out: List[str] = []
+    if p.get("summary"):
+        out.append(p["summary"])
+    out.extend(p.get("topics") or [])
+    out.extend(p.get("decisions") or [])
+    out.extend(p.get("ideas") or [])
+    out.extend(p.get("risks") or [])
+    out.extend(p.get("next_steps") or [])
+    for item in p.get("action_items") or []:
+        if isinstance(item, dict) and item.get("task"):
+            out.append(item["task"])
+    return _dedupe_texts(out, strong=True)
+
+
+def build_protocol_prompt(transcript: str) -> str:
+    schema = r'''{
+  "summary": "string|null",
+  "topics": ["string"],
+  "decisions": ["string"],
+  "action_items": [
+    {
+      "task": "string",
+      "assignee": "string|null",
+      "due": "string|null"
+    }
+  ],
+  "ideas": ["string"],
+  "risks": ["string"],
+  "next_steps": ["string"],
+  "notes": "string|null"
+}'''
+    return f"""
+Ты — система, которая возвращает ТОЛЬКО JSON.
+НЕЛЬЗЯ: markdown, пояснения, текст до/после JSON, списки, заголовки.
+
+Ответ должен быть валидным JSON и соответствовать схеме (типы допускаются как указано):
+{schema}
+
+Правила заполнения:
+- Не выдумывай факты. Используй только то, что явно есть в транскрипте.
+- Если для какого-то блока данных недостаточно — ставь пустой массив [] или null.
+- summary: краткое и фактическое резюме разговора, только если материала достаточно. Если созвон слишком пустой/шумный — null.
+- topics: внутренние темы разговора для аналитики. Если тем явно не прослеживается — [].
+- decisions: только явно принятые решения/согласования по маркерам типа «решили/согласовали/договорились».
+- action_items: только конкретные задачи. due передавай строкой как в речи, assignee — только если назван.
+- ideas: только идеи, гипотезы, предложения, варианты. Если их нет явно — [].
+- risks: только явно озвученные риски, блокеры, проблемы. Если их нет явно — [].
+- next_steps: только явно проговорённые следующие шаги по маркерам типа «далее/затем/после чего».
+- НИКОГДА не включай в decisions/ideas/risks/topics/action_items приветствия, проверку звука, рекламу, подписки на канал, прощания, междометия и шум.
+- НИКОГДА не подменяй ideas темами разговора.
+- notes: только если нужно коротко отметить ограничение/неопределённость; иначе null.
+
+Транскрипт:
+{transcript}
+
+Верни ТОЛЬКО JSON.
+""".strip()
+
+
+def build_chunk_prompt(chunk_text: str, chunk_index: int, total_chunks: int) -> str:
+    schema = r'''{
+  "chunk_index": "integer",
+  "chunk_summary": "string",
+  "topics": ["string"],
+  "decisions": ["string"],
+  "action_items": [
+    {
+      "task": "string",
+      "assignee": "string|null",
+      "due": "string|null"
+    }
+  ],
+  "ideas": ["string"],
+  "risks": ["string"],
+  "next_steps": ["string"],
+  "key_facts": ["string"]
+}'''
+    return f"""
+Ты — система, которая возвращает ТОЛЬКО JSON (без markdown и без текста вокруг).
+Верни валидный JSON по схеме:
+{schema}
+
+Уточнения:
+- chunk_index: поставь {chunk_index}
+- chunk_summary: 2–6 предложений, только если в чанке достаточно фактов; иначе null.
+- Не выдумывай факты. Если для блока нет данных — [].
+- topics: краткие темы чанка для внутренней аналитики.
+- decisions/action_items/ideas/risks/next_steps: только то, что явно есть в чанке.
+- Никогда не клади в ideas обычные темы, приветствия, проверку звука, рекламу, подписи и прощания.
+- key_facts: короткие факты/цифры/даты/имена из чанка.
+
+Чанк {chunk_index}/{total_chunks}:
+{chunk_text}
+
+Верни ТОЛЬКО JSON.
+""".strip()
+
+
+async def _groq_generate_json(prompt: str, model_name: str, timeout_s: float, *, temperature: float = 0.1) -> Dict[str, Any]:
+    system_prompt = "Ты — система, которая возвращает ТОЛЬКО JSON."
+    return await groq_chat_json(system_prompt, prompt, model=model_name, temperature=temperature, timeout_s=timeout_s)
+
+
+def _smart_split_text(text: str, target_chars: int = 8000, overlap_chars: int = 600) -> List[str]:
+    t = (text or "").strip()
+    if not t:
+        return []
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    chunks: List[str] = []
+    i = 0
+    n = len(t)
+    while i < n:
+        end = min(i + target_chars, n)
+        cut = end
+        window_start = max(i, end - 1200)
+        window = t[window_start:end]
+        best = None
+        for sep in ["\n", ". ", "? ", "! "]:
+            pos = window.rfind(sep)
+            if pos != -1:
+                best = window_start + pos + (1 if sep == "\n" else 2)
+                break
+        if best and best > i + int(target_chars * 0.6):
+            cut = best
+        chunk = t[i:cut].strip()
+        if chunk:
+            chunks.append(chunk)
+        if cut >= n:
+            break
+        i = max(cut - overlap_chars, 0)
+    return chunks
+
+
+async def generate_protocol_via_groq(transcript: str, model: str | None = None, ollama_base_url: str | None = None, timeout_s: float = 600.0) -> Dict[str, Any]:
+    model_name = model or settings.groq_model
+    max_chars = 12000
+    t = (transcript or "").strip()
+    if len(t) > max_chars:
+        half = max_chars // 2
+        t = t[:half] + "\n\n...[TRUNCATED]...\n\n" + t[-half:]
+    prompt = build_protocol_prompt(t)
+    try:
+        return normalize_protocol_state(await _groq_generate_json(prompt, model_name, timeout_s, temperature=0.1), transcript)
+    except Exception as exc:
+        return normalize_protocol_state({
+            "summary": None,
+            "topics": [],
+            "decisions": [],
+            "action_items": [],
+            "ideas": [],
+            "risks": [],
+            "next_steps": [],
+            "notes": f"PROTOCOL_ERROR: {exc}",
+        }, transcript)
+
+
+async def generate_protocol_via_groq_chunked(transcript: str, model: str | None = None, ollama_base_url: str | None = None, timeout_s: float = 600.0, *, chunk_target_chars: int = 8000, chunk_overlap_chars: int = 600) -> Dict[str, Any]:
+    model_name = model or settings.groq_model
+    chunks = _smart_split_text(transcript, target_chars=chunk_target_chars, overlap_chars=chunk_overlap_chars)
+    if not chunks:
+        return normalize_protocol_state({
+            "summary": None,
+            "topics": [],
+            "decisions": [],
+            "action_items": [],
+            "ideas": [],
+            "risks": [],
+            "next_steps": [],
+            "notes": "EMPTY_TRANSCRIPT",
+        }, transcript)
+
+    total = len(chunks)
+    chunk_summaries: List[Dict[str, Any]] = []
+    for idx, ch in enumerate(chunks, start=1):
+        prompt = build_chunk_prompt(ch, idx, total)
+        try:
+            obj = await _groq_generate_json(prompt, model_name, timeout_s, temperature=0.1)
+            obj["chunk_index"] = idx
+            chunk_summaries.append(obj)
+        except Exception as exc:
+            chunk_summaries.append({
+                "chunk_index": idx,
+                "chunk_summary": "",
+                "topics": [],
+                "decisions": [],
+                "action_items": [],
+                "ideas": [],
+                "risks": [],
+                "next_steps": [],
+                "key_facts": [],
+                "error": str(exc),
+            })
+
+    packed = []
+    for cs in chunk_summaries:
+        packed.append({
+            "chunk_index": cs.get("chunk_index"),
+            "chunk_summary": cs.get("chunk_summary"),
+            "topics": cs.get("topics", []),
+            "decisions": cs.get("decisions", []),
+            "action_items": cs.get("action_items", []),
+            "ideas": cs.get("ideas", []),
+            "risks": cs.get("risks", []),
+            "next_steps": cs.get("next_steps", []),
+            "key_facts": cs.get("key_facts", []),
+            "error": cs.get("error"),
+        })
+
+    reduce_input = json.dumps({"chunks": packed}, ensure_ascii=False)
+    reduce_prompt = f"""
+Ты — система, которая возвращает ТОЛЬКО JSON (без markdown и без текста вокруг).
+
+Ниже дан JSON со сводками частей длинного созвона. На его основе составь ИТОГОВЫЙ протокол по схеме:
+{{
+  "summary": "string|null",
+  "topics": ["string"],
+  "decisions": ["string"],
+  "action_items": [{{"task":"string","assignee":"string|null","due":"string|null"}}],
+  "ideas": ["string"],
+  "risks": ["string"],
+  "next_steps": ["string"],
+  "notes": "string|null"
+}}
+
+Правила:
+- Не выдумывай факты. Если данных для блока нет — оставь [] или null.
+- summary: связное, фактическое резюме всего созвона; если материала мало — null.
+- topics: внутренние темы разговора для аналитики.
+- decisions/action_items/ideas/risks/next_steps: объедини без дублей, сохрани только явно подтверждённое в чанках.
+- Не заполняй ideas, если в чанках нет явных предложений/вариантов/гипотез.
+- Если часть чанков содержит error — упомяни в notes, но всё равно собери протокол.
+
+Данные:
+{reduce_input}
+
+Верни ТОЛЬКО JSON.
+""".strip()
+
+    try:
+        final_obj = await _groq_generate_json(reduce_prompt, model_name, timeout_s, temperature=0.1)
+        final_obj["_meta"] = {"chunks": total}
+        return normalize_protocol_state(final_obj, transcript)
+    except Exception as exc:
+        return normalize_protocol_state({
+            "summary": None,
+            "topics": [],
+            "decisions": [],
+            "action_items": [],
+            "ideas": [],
+            "risks": [],
+            "next_steps": [],
+            "notes": f"FINAL_PROTOCOL_ERROR: {exc}",
+            "_meta": {"chunks": total},
+        }, transcript)
+
+
+def build_state_update_prompt(current_state_json: str, new_text: str) -> str:
+    schema = r'''{
+  "summary": "string|null",
+  "topics": ["string"],
+  "decisions": ["string"],
+  "action_items": [
+    {
+      "task": "string",
+      "assignee": "string|null",
+      "due": "string|null"
+    }
+  ],
+  "ideas": ["string"],
+  "risks": ["string"],
+  "next_steps": ["string"],
+  "notes": "string|null"
+}'''
+    return f"""
+Ты — система, которая возвращает ТОЛЬКО JSON (никакого markdown и текста вокруг).
+
+Твоя задача: обновить JSON-состояние протокола на основе нового фрагмента транскрипта.
+Верни валидный JSON строго по схеме:
+{schema}
+
+Правила:
+- Используй current_state как базу и ДОБАВЬ/ОБНОВИ данные из new_text.
+- Не выдумывай факты, которых нет в new_text.
+- topics/decisions/risks/action_items/ideas/next_steps: добавляй новые элементы, не дублируй уже имеющиеся по смыслу.
+- summary: поддерживай как краткую живую сводку всего разговора до текущего момента только по подтверждённым фактам; если фактов мало — можно оставить null.
+- Не клади в ideas простые темы разговора.
+- Не включай приветствия, рекламу, шум, проверку звука и прощания ни в один блок.
+- Если что-то непонятно — не добавляй.
+
+current_state (JSON):
+{current_state_json}
+
+new_text:
+{new_text}
+
+Верни ТОЛЬКО JSON.
+""".strip()
+
+
+async def update_protocol_state_via_groq(current_state: dict, new_text: str, model: str | None = None, ollama_base_url: str | None = None, timeout_s: float = 180.0) -> dict:
+    model_name = model or settings.groq_model
+    nt = (new_text or "").strip()
+    if not nt:
+        return normalize_protocol_state(current_state)
+    current_json = json.dumps(current_state or {}, ensure_ascii=False)
+    prompt = build_state_update_prompt(current_json, nt)
+    try:
+        return normalize_protocol_state(await _groq_generate_json(prompt, model_name, timeout_s, temperature=0.1), nt)
+    except Exception as exc:
+        s = dict(current_state or {})
+        notes = s.get("notes")
+        msg = f"STATE_UPDATE_ERROR: {exc}"
+        s["notes"] = ((str(notes) + "\n") if notes else "") + msg
+        return normalize_protocol_state(s, nt)
+
+
+def build_finalize_prompt(state_json: str) -> str:
+    schema = r'''{
+  "summary": "string|null",
+  "topics": ["string"],
+  "decisions": ["string"],
+  "action_items": [
+    {
+      "task": "string",
+      "assignee": "string|null",
+      "due": "string|null"
+    }
+  ],
+  "ideas": ["string"],
+  "risks": ["string"],
+  "next_steps": ["string"],
+  "notes": "string|null"
+}'''
+    return f"""
+Ты — система, которая возвращает ТОЛЬКО JSON.
+
+Ниже дано итоговое состояние протокола (черновик), накопленное по кускам.
+Твоя задача: привести к финальному виду:
+- убрать дубли по смыслу
+- уточнить формулировки без выдумывания фактов
+- summary сделать связным резюме всего созвона только если фактов достаточно
+- сохранить единый формат данных
+- не подменять ideas темами разговора
+- не включать шум, рекламу, проверку звука, приветствия и прощания
+
+Верни валидный JSON строго по схеме:
+{schema}
+
+draft_state:
+{state_json}
+
+Верни ТОЛЬКО JSON.
+""".strip()
+
+
+async def finalize_protocol_via_groq(state: dict, model: str | None = None, ollama_base_url: str | None = None, timeout_s: float = 180.0) -> dict:
+    model_name = model or settings.groq_model
+    state_json = json.dumps(state or {}, ensure_ascii=False)
+    prompt = build_finalize_prompt(state_json)
+    try:
+        return normalize_protocol_state(await _groq_generate_json(prompt, model_name, timeout_s, temperature=0.1))
+    except Exception as exc:
+        s = dict(state or {})
+        notes = s.get("notes")
+        msg = f"FINALIZE_ERROR: {exc}"
+        s["notes"] = ((str(notes) + "\n") if notes else "") + msg
+        return normalize_protocol_state(s)
+
+
+def render_protocol_text(p: dict | None) -> str:
+    p = normalize_protocol_state(p)
+    if not p or not isinstance(p, dict):
+        return "🧾 ПРОТОКОЛ ВСТРЕЧИ\n\n(Пока нет данных для сводки.)"
+
+    def clean(s: Any) -> str:
+        return s.strip() if isinstance(s, str) else ""
+
+    summary = clean(p.get("summary"))
+    decisions = _dedupe_texts(p.get("decisions") or [], strong=True)
+    ideas = _dedupe_texts(p.get("ideas") or [], strong=True)
+    risks = _dedupe_texts(p.get("risks") or [], strong=True)
+    next_steps = _dedupe_texts(p.get("next_steps") or [], strong=True)
+
+    action_lines = []
+    for item in p.get("action_items") or []:
+        if not isinstance(item, dict):
+            continue
+        task = clean(item.get("task"))
+        assignee = clean(item.get("assignee"))
+        due = clean(item.get("due"))
+        if not task:
+            continue
+        line = f"- {task}"
+        meta = []
+        if assignee:
+            meta.append(f"ответственный: {assignee}")
+        if due:
+            meta.append(f"срок: {due}")
+        if meta:
+            line += f" ({', '.join(meta)})"
+        action_lines.append(line)
+
+    out = ["🧾 ПРОТОКОЛ ВСТРЕЧИ", ""]
+    if summary:
+        out.extend(["Кратко:", summary, ""])
+    if decisions:
+        out.extend(["Решения:", "\n".join(f"- {x}" for x in decisions), ""])
+    if action_lines:
+        out.extend(["Задачи:", "\n".join(action_lines), ""])
+    if ideas:
+        out.extend(["Идеи:", "\n".join(f"- {x}" for x in ideas), ""])
+    if risks:
+        out.extend(["Риски:", "\n".join(f"- {x}" for x in risks), ""])
+    if next_steps:
+        out.extend(["Следующие шаги:", "\n".join(f"- {x}" for x in next_steps), ""])
+    text = "\n".join(out).strip()
+    return text if text != "🧾 ПРОТОКОЛ ВСТРЕЧИ" else "🧾 ПРОТОКОЛ ВСТРЕЧИ\n\n(Пока нет данных для сводки.)"

@@ -1,0 +1,600 @@
+import re
+import time
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+
+from .asr import transcribe_pcm16_window
+from ..config import settings
+
+
+PROMO_PATTERNS = [
+    # Whisper-галлюцинации, унаследованные от веб-аудио с транскрипцией.
+    r"\bподписывайтесь на наш канал\b",
+    r"\bподписывайтесь\b",
+    r"\bспасибо за просмотр\b",
+    r"\bпродолжение следует\b",
+    r"\bредактор субтитров\b",
+    r"\bсубтитры\b",
+    r"\bмузыка\b",
+    # Системные сообщения видеоконференций (Zoom/Meet/Telemost),
+    # которые часто попадают в начало записи как реально произнесённый
+    # автоматический голос.
+    r"\brecording in progress\b",
+    r"\brecording stopped\b",
+    r"\brecording started\b",
+    r"\bthis meeting is being recorded\b",
+    r"\bзапись начата\b",
+    r"\bзапись остановлена\b",
+    r"\bзапись на облако\b",
+    r"\bвстреча записывается\b",
+    # Типовые промо-вставки ведущих в публичных видео (Youtube/подкасты),
+    # которые читаются как нормальная человеческая речь и не отлавливаются
+    # ASR-фильтрами.
+    r"\bссылк[аиу]\s+(?:в|вы\s+найд[её]те\s+в)\s+профиле\b",
+    r"\bссылк[аиу]\s+в\s+описании\b",
+    r"\bпереходи(?:те)?\s+по\s+ссылке\b",
+    r"\bпо\s+поисков\w+\s+слов\w+\b",
+    r"\bвыложил\s+(?:в|на)\s+(?:закреп(?:е|у|\W)?|(?:(?:телеграм|telegram)[\s\-]*)?канал|телеграм|telegram)\b",
+    r"\b(?:по\s+закреп[уле]|позакреп[уе]?)\b",
+    r"\bдоступен\s+для\s+подписчиков\s+канала\b",
+    r"\bкр\s+код\s+на\s+экране\b",
+    r"\bqr[\s\-]*код[ау]?\s+на\s+экране\b",
+]
+
+
+def pcm16_bytes_to_np(pcm: bytes) -> np.ndarray:
+    return np.frombuffer(pcm, dtype=np.int16).copy()
+
+
+def format_transcript(lines: List[Tuple[str, str]]) -> str:
+    out = []
+    for spk, txt in lines:
+        txt = (txt or "").strip()
+        if not txt:
+            continue
+        out.append(f"{spk}: {txt}")
+    return "\n".join(out).strip()
+
+
+def _norm_text(text: str) -> str:
+    return re.sub(r"[^\w\s]", "", (text or "").lower()).replace("ё", "е").strip()
+
+
+def _norm_words(text: str) -> List[str]:
+    return [w for w in _norm_text(text).split() if w]
+
+
+def _split_speaker_and_body(line: str) -> Tuple[str, str]:
+    raw = (line or "").strip()
+    m = re.match(r"^(ME|THEM):\s*(.*)$", raw, flags=re.I)
+    if m:
+        return m.group(1).upper(), m.group(2).strip()
+    return "", raw
+
+
+def _sim(a: str, b: str) -> float:
+    return SequenceMatcher(None, _norm_text(a), _norm_text(b)).ratio()
+
+
+def _jaccard_words(a: str, b: str) -> float:
+    wa = set(_norm_words(a))
+    wb = set(_norm_words(b))
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / max(1, len(wa | wb))
+
+
+def _contains_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+
+def _collapse_repeated_phrases(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return ""
+    for phrase in ["подписывайтесь на наш канал", "подписывайтесь"]:
+        pattern = rf"(?:{re.escape(phrase)}(?:\s+и\s+)?)+"
+        t = re.sub(pattern, phrase, t, flags=re.I)
+    t = re.sub(r"\b(\w+)(?:\s+\1){2,}\b", r"\1", t, flags=re.I)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _sanitize_segment_body(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return ""
+    t = _collapse_repeated_phrases(t)
+    t = re.sub(r"\bантипугиатом\b", "антиплагиатом", t, flags=re.I)
+    t = re.sub(r"\bполил антиплагиат\b", "палил антиплагиат", t, flags=re.I)
+    t = re.sub(r"\bпроизводим все необходимые диаграммы\b", "сделать все необходимые диаграммы", t, flags=re.I)
+    t = re.sub(r"\bзаписать приложение, чтобы оно работало корректно\b", "дописать приложение, чтобы оно работало корректно", t, flags=re.I)
+    t = re.sub(r"\bstart writing the third chapter\b", "начать писать третью главу", t, flags=re.I)
+    t = re.sub(r"\bstart writing the second chapter\b", "начать писать вторую главу", t, flags=re.I)
+    t = re.sub(r"\bwrite the third chapter\b", "написать третью главу", t, flags=re.I)
+    t = re.sub(r"\bwrite the second chapter\b", "написать вторую главу", t, flags=re.I)
+    t = re.sub(r"\bapp\b", "приложение", t, flags=re.I)
+    t = re.sub(r"\s+", " ", t).strip(" .,-")
+    return t
+
+
+def _looks_like_noise_text(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return True
+
+    low = t.lower()
+    body = re.sub(r"^(ME|THEM):\s*", "", t, flags=re.IGNORECASE).strip()
+
+    if _contains_cjk(body):
+        return True
+    if any(re.search(pat, low) for pat in PROMO_PATTERNS):
+        return True
+    if re.fullmatch(r"[\d\s,.:;!?#%+\-/]+", body or "") and len(body) <= 2:
+        return True
+
+    letters = re.findall(r"[A-Za-zА-Яа-яЁё]", body)
+    digits = re.findall(r"\d", body)
+    if not letters and digits and len(body) <= 2:
+        return True
+
+    words = low.split()
+    if len(words) > 6 and len(set(words)) / max(1, len(words)) < 0.34:
+        return True
+
+    if re.search(r"\b(?:раз\s*,?\s*два\s*,?\s*три|как меня слышно|слышно ли)\b", low):
+        return False
+
+    return False
+
+
+def _sanitize_line(line: str) -> str:
+    raw = (line or "").strip()
+    if not raw:
+        return ""
+    prefix = ""
+    body = raw
+    m = re.match(r"^(ME|THEM):\s*(.*)$", raw, flags=re.I)
+    if m:
+        prefix = m.group(1).upper() + ": "
+        body = m.group(2)
+    body = _sanitize_segment_body(body)
+    if not body or _looks_like_noise_text(prefix + body):
+        return ""
+    if body:
+        body = body[0].upper() + body[1:]
+    return f"{prefix}{body}".strip()
+
+
+def _line_overlap(a: str, b: str, *, min_words: int = 2) -> bool:
+    spk_a, body_a = _split_speaker_and_body(a)
+    spk_b, body_b = _split_speaker_and_body(b)
+
+    if spk_a and spk_b and spk_a != spk_b:
+        return False
+
+    wa = _norm_words(body_a)
+    wb = _norm_words(body_b)
+    if not wa or not wb:
+        return False
+
+    max_k = min(len(wa), len(wb), 12)
+    for k in range(max_k, min_words - 1, -1):
+        if wa[-k:] == wb[:k] or wb[-k:] == wa[:k]:
+            return True
+    return False
+
+
+def _extract_numbers(text: str) -> List[str]:
+    body = re.sub(r"^(ME|THEM):\s*", "", text or "", flags=re.I).strip()
+    return re.findall(r"\d+", body)
+
+
+def _is_mostly_numeric(text: str) -> bool:
+    body = re.sub(r"^(ME|THEM):\s*", "", text or "", flags=re.I).strip()
+    if not body:
+        return False
+    nums = re.findall(r"\d+", body)
+    words = re.findall(r"[A-Za-zА-Яа-яЁё]+", body)
+    return len(nums) >= 3 and len(nums) >= max(1, len(words))
+
+
+def _should_replace_recent(old: str, new: str) -> bool:
+    old_spk, old_body = _split_speaker_and_body(old)
+    new_spk, new_body = _split_speaker_and_body(new)
+
+    if not old_spk or not new_spk or old_spk != new_spk:
+        return False
+
+    # Для чисел не делаем агрессивное схлопывание.
+    # Иначе "1..20" легко затирается "10..30".
+    if _is_mostly_numeric(old) or _is_mostly_numeric(new):
+        return _norm_text(old_body) == _norm_text(new_body)
+
+    n_old = _norm_text(old_body)
+    n_new = _norm_text(new_body)
+    if not n_old or not n_new:
+        return False
+
+    sim = _sim(old_body, new_body)
+    jac = _jaccard_words(old_body, new_body)
+
+    if n_new == n_old:
+        return True
+    if n_new in n_old or n_old in n_new:
+        return True
+    if _line_overlap(old, new, min_words=2):
+        return True
+    if sim >= 0.72:
+        return True
+    if jac >= 0.50:
+        return True
+    if len(n_old.split()) >= 5 and len(n_new.split()) >= 5 and sim >= 0.62 and jac >= 0.35:
+        return True
+
+    return False
+
+
+def _prefer_line(existing: str, candidate: str) -> str:
+    _, ex_body = _split_speaker_and_body(existing)
+    _, ca_body = _split_speaker_and_body(candidate)
+
+    ex_len = len(_norm_words(ex_body))
+    ca_len = len(_norm_words(ca_body))
+
+    if ca_len > ex_len:
+        return candidate
+    if ca_len == ex_len and len(_norm_text(ca_body)) >= len(_norm_text(ex_body)):
+        return candidate
+    return existing
+
+
+def _merge_line_list(lines: List[str], line: str) -> List[str]:
+    clean = _sanitize_line(line)
+    if not clean:
+        return lines
+
+    # Окно поиска перекрывающихся реплик расширено с 4 до 12 строк назад:
+    # длинные дублирующиеся реплики ASR (когда чанк выдаёт сначала короткую
+    # форму, а потом докатывает её же в полной форме) часто разнесены на 5-8
+    # строк и при окне в 4 строки не схлопывались. Дополнительно для каждой
+    # пары делается проверка вложения нормализованных тел (substring), чтобы
+    # ловить случаи, когда _should_replace_recent не срабатывает по ratio.
+    start_idx = max(0, len(lines) - 12)
+    clean_spk, clean_body = _split_speaker_and_body(clean)
+    n_clean = _norm_text(clean_body)
+    for idx in range(start_idx, len(lines)):
+        old = lines[idx]
+        if _should_replace_recent(old, clean):
+            lines[idx] = _prefer_line(old, clean)
+            return lines
+        # дополнительная проверка: если новая реплика того же говорящего
+        # является нормализованным префиксом или подстрокой существующей
+        # (или наоборот) — это всё ещё дубль, даже если ratio ниже порога.
+        old_spk, old_body = _split_speaker_and_body(old)
+        if clean_spk and old_spk and clean_spk == old_spk and n_clean:
+            n_old = _norm_text(old_body)
+            if n_old and len(n_clean.split()) >= 4 and len(n_old.split()) >= 4:
+                if n_clean in n_old or n_old in n_clean:
+                    lines[idx] = _prefer_line(old, clean)
+                    return lines
+
+    lines.append(clean)
+    return lines
+
+
+def _dedupe_join(existing: str, delta: str) -> str:
+    merged: List[str] = []
+
+    for raw in (existing or "").splitlines():
+        if raw.strip():
+            merged = _merge_line_list(merged, raw)
+
+    for raw in (delta or "").splitlines():
+        if raw.strip():
+            merged = _merge_line_list(merged, raw)
+
+    return "\n".join(merged).strip()
+
+
+def _sanitize_transcript_text(text: str) -> str:
+    result: List[str] = []
+    for raw in (text or "").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        result = _merge_line_list(result, raw)
+    return "\n".join(result).strip()
+
+
+def _pick_analysis_window(pcm16: np.ndarray, sample_rate: int) -> Tuple[np.ndarray, float]:
+    win_s = float(getattr(settings, "asr_window_seconds", 24.0))
+    max_samples = int(sample_rate * win_s)
+    if pcm16.size <= max_samples:
+        return pcm16, 0.0
+    abs_start_s = (pcm16.size - max_samples) / float(sample_rate)
+    return pcm16[-max_samples:], abs_start_s
+
+
+@dataclass
+class AudioTrackSession:
+    speaker: str
+    created_ts: float = field(default_factory=time.time)
+    last_ts: float = field(default_factory=time.time)
+    pcm16: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int16))
+    total_samples: int = 0
+    full_transcript: str = ""
+    last_window_transcript: str = ""
+    last_committed_end_abs_s: float = 0.0
+    last_partial_text: str = ""
+
+    def append_audio(self, pcm16_chunk: np.ndarray):
+        self.last_ts = time.time()
+        self.total_samples += int(pcm16_chunk.size)
+        self.pcm16 = pcm16_chunk if self.pcm16.size == 0 else np.concatenate([self.pcm16, pcm16_chunk])
+
+        max_seconds = float(getattr(settings, "buffer_max_seconds", 90.0))
+        max_samples = int(settings.audio_sample_rate * max_seconds)
+        if self.pcm16.size > max_samples:
+            self.pcm16 = self.pcm16[-max_samples:]
+
+    def _now_abs_s(self) -> float:
+        return float(self.total_samples) / float(settings.audio_sample_rate)
+
+    def transcribe_window(self) -> Tuple[str, str]:
+        min_audio_s = float(getattr(settings, "asr_min_audio_seconds", 0.8) or 0.8)
+        if self.pcm16.size < int(settings.audio_sample_rate * min_audio_s):
+            return "", ""
+
+        pcm_win, _ = _pick_analysis_window(self.pcm16, settings.audio_sample_rate)
+        now_abs_s = self._now_abs_s()
+        win_len_s = float(pcm_win.size) / float(settings.audio_sample_rate)
+        win_start_abs_s = max(0.0, now_abs_s - win_len_s)
+
+        res = transcribe_pcm16_window(
+            pcm_win,
+            sample_rate=settings.audio_sample_rate,
+            language=settings.asr_language,
+            return_segments=True,
+            initial_prompt=(
+                "Привет! Это рабочая встреча или собеседование на русском языке. "
+                "Сохраняй оригинальный язык фразы и не переводи её. "
+                "Если пользователь перечисляет числа, сохраняй их последовательно и без пропусков."
+            ),
+        )
+
+        if isinstance(res, tuple) and len(res) == 2:
+            text, segs = res
+        else:
+            text, segs = (res or ""), []
+
+        if segs:
+            window_lines = []
+            for seg in segs:
+                if isinstance(seg, (tuple, list)) and len(seg) >= 3:
+                    st, en, t = seg[0], seg[1], seg[2]
+                else:
+                    st = getattr(seg, "start", 0.0) or 0.0
+                    en = getattr(seg, "end", 0.0) or 0.0
+                    t = getattr(seg, "text", "") or ""
+
+                clean = _sanitize_segment_body(t)
+                if clean and not _looks_like_noise_text(f"{self.speaker}: {clean}"):
+                    window_lines.append((float(st), float(en), f"{self.speaker}: {clean}"))
+
+            window_text = "\n".join(x[2] for x in window_lines).strip()
+        else:
+            clean = _sanitize_segment_body(text)
+            if clean and not _looks_like_noise_text(f"{self.speaker}: {clean}"):
+                window_text = format_transcript([(self.speaker, clean)])
+            else:
+                window_text = ""
+
+            self.last_window_transcript = _sanitize_transcript_text(window_text)
+            if self.last_window_transcript and self.last_window_transcript != self.last_partial_text:
+                self.last_partial_text = self.last_window_transcript
+                return self.last_window_transcript, self.last_window_transcript
+            return "", self.last_window_transcript
+
+        stability_s = float(getattr(settings, "asr_commit_stability_seconds", 1.2) or 1.2)
+        stable_cutoff = max(0.0, now_abs_s - stability_s)
+
+        committed_lines: List[str] = []
+        tail_lines: List[str] = []
+
+        for st, en, line in window_lines:
+            seg_end_abs = win_start_abs_s + float(en)
+
+            if seg_end_abs <= (self.last_committed_end_abs_s + 1e-3):
+                continue
+
+            if seg_end_abs <= stable_cutoff:
+                committed_lines.append(line)
+                self.last_committed_end_abs_s = max(self.last_committed_end_abs_s, seg_end_abs)
+            else:
+                tail_lines.append(line)
+
+        delta = _sanitize_transcript_text("\n".join(committed_lines).strip())
+
+        if delta:
+            before = _sanitize_transcript_text(self.full_transcript)
+            after = _dedupe_join(before, delta)
+            after = _sanitize_transcript_text(after)
+            if after != before:
+                self.full_transcript = after
+                delta = after[len(before):].strip() if before and after.startswith(before) else delta
+            else:
+                delta = ""
+
+        partial = _sanitize_transcript_text("\n".join(tail_lines).strip())
+        self.last_window_transcript = _sanitize_transcript_text(window_text)
+        self.last_partial_text = partial
+
+        return delta, self.last_window_transcript
+
+    def transcribe_full_buffer(self) -> str:
+        # Накопленный за всю сессию транскрипт. Ниже мы используем его как основу,
+        # а свежую ретранскрибацию последних buffer_max_seconds секунд PCM-буфера
+        # лишь СЛИВАЕМ в хвост существующего текста через _dedupe_join.
+        # Раньше здесь возвращалась только свежая ретранскрибация, что для длинных
+        # сессий означало потерю всего, что выпало из 90-секундного PCM-окна.
+        accumulated = _sanitize_transcript_text(self.final_text())
+
+        # Для длинных уже накопленных транскриптов пропускаем тяжёлую
+        # финальную ретранскрибацию: она дублирует то, что уже прошло через
+        # streaming, и заметно блокирует финализацию (особенно если делать её
+        # дважды — для mic и tab последовательно).
+        if len(accumulated) >= 2000:
+            return accumulated
+
+        min_audio_s = float(getattr(settings, "asr_min_audio_seconds", 0.8) or 0.8)
+        if self.pcm16.size < int(settings.audio_sample_rate * min_audio_s):
+            return accumulated
+
+        res = transcribe_pcm16_window(
+            self.pcm16,
+            sample_rate=settings.audio_sample_rate,
+            language=settings.asr_language,
+            return_segments=True,
+            initial_prompt=(
+                "Привет! Это рабочая встреча или собеседование на русском языке. "
+                "Сохраняй оригинальный язык фразы и не переводи её. "
+                "Если пользователь перечисляет числа, сохраняй их последовательно и без пропусков."
+            ),
+        )
+
+        if isinstance(res, tuple) and len(res) == 2:
+            text, segs = res
+        else:
+            text, segs = (res or ""), []
+
+        fresh_lines: List[Tuple[str, str]] = []
+        if segs:
+            for seg in segs:
+                if isinstance(seg, (tuple, list)) and len(seg) >= 3:
+                    t = seg[2]
+                else:
+                    t = getattr(seg, "text", "") or ""
+                clean = _sanitize_segment_body(t)
+                if clean and not _looks_like_noise_text(f"{self.speaker}: {clean}"):
+                    fresh_lines.append((self.speaker, clean))
+        else:
+            clean = _sanitize_segment_body(text)
+            if clean and not _looks_like_noise_text(f"{self.speaker}: {clean}"):
+                fresh_lines.append((self.speaker, clean))
+
+        fresh_text = _sanitize_transcript_text(format_transcript(fresh_lines)) if fresh_lines else ""
+
+        if not fresh_text:
+            return accumulated
+        if not accumulated:
+            return fresh_text
+        # Дедуп-склейка: совпадающие по смыслу строки в хвосте accumulated
+        # схлопнутся со свежими, новых строк здесь обычно нет — только уточнение
+        # хвоста. Так мы получаем «полный накопленный транскрипт + аккуратно
+        # уточнённый хвост последних buffer_max_seconds секунд».
+        return _sanitize_transcript_text(_dedupe_join(accumulated, fresh_text))
+
+    def final_text(self) -> str:
+        committed = _sanitize_transcript_text(self.full_transcript)
+        partial = _sanitize_transcript_text(self.last_partial_text)
+
+        if committed and partial:
+            if _norm_text(partial) in _norm_text(committed):
+                return committed
+            return _sanitize_transcript_text(_dedupe_join(committed, partial))
+
+        return committed or partial or ""
+
+
+@dataclass
+class MultiStreamSession:
+    session_id: str
+    created_ts: float = field(default_factory=time.time)
+    last_ts: float = field(default_factory=time.time)
+    tracks: Dict[str, AudioTrackSession] = field(default_factory=dict)
+    protocol: dict = field(default_factory=dict)
+    insights: List[dict] = field(default_factory=list)
+    trigger_state: Dict[str, bool] = field(default_factory=dict)
+    last_trigger_fired_ts: Dict[str, float] = field(default_factory=dict)
+
+    def ensure_tracks(self):
+        if "mic" not in self.tracks:
+            self.tracks["mic"] = AudioTrackSession(speaker="ME")
+        if "tab" not in self.tracks:
+            self.tracks["tab"] = AudioTrackSession(speaker="THEM")
+
+    def append_audio(self, source: str, pcm16_chunk: np.ndarray):
+        self.ensure_tracks()
+        self.last_ts = time.time()
+        src = "mic" if source == "mic" else "tab"
+        self.tracks[src].append_audio(pcm16_chunk)
+
+    def transcribe_window(self, source: str) -> Tuple[str, str]:
+        self.ensure_tracks()
+        src = "mic" if source == "mic" else "tab"
+        return self.tracks[src].transcribe_window()
+
+    def combined_window(self) -> str:
+        self.ensure_tracks()
+        mic = _sanitize_transcript_text(self.tracks["mic"].last_window_transcript)
+        tab = _sanitize_transcript_text(self.tracks["tab"].last_window_transcript)
+
+        parts = []
+        if tab:
+            parts.append(tab)
+        if mic:
+            parts.append(mic)
+        return "\n".join(parts).strip()
+
+    def combined_full_transcript(self) -> str:
+        self.ensure_tracks()
+        mic = _sanitize_transcript_text(self.tracks["mic"].final_text())
+        tab = _sanitize_transcript_text(self.tracks["tab"].final_text())
+
+        parts = []
+        if tab:
+            parts.append(tab)
+        if mic:
+            parts.append(mic)
+        return "\n".join(parts).strip()
+
+    def combined_full_retranscribed(self) -> str:
+        self.ensure_tracks()
+        tab = _sanitize_transcript_text(self.tracks["tab"].transcribe_full_buffer())
+        mic = _sanitize_transcript_text(self.tracks["mic"].transcribe_full_buffer())
+
+        parts = []
+        if tab:
+            parts.append(tab)
+        if mic:
+            parts.append(mic)
+        return "\n".join(parts).strip()
+
+
+class SessionRegistry:
+    def __init__(self):
+        self.sessions: Dict[str, MultiStreamSession] = {}
+
+    def create(self, session_id: str) -> MultiStreamSession:
+        s = MultiStreamSession(session_id=session_id, protocol={})
+        s.ensure_tracks()
+        self.sessions[session_id] = s
+        return s
+
+    def get(self, session_id: str) -> Optional[MultiStreamSession]:
+        return self.sessions.get(session_id)
+
+    def pop(self, session_id: str) -> Optional[MultiStreamSession]:
+        return self.sessions.pop(session_id, None)
+
+    def cleanup(self, max_age_s: int = 6 * 60 * 60):
+        now = time.time()
+        old = [sid for sid, s in self.sessions.items() if (now - s.last_ts) > max_age_s]
+        for sid in old:
+            self.sessions.pop(sid, None)
+
+
+registry = SessionRegistry()

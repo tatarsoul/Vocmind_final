@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "VocMind Recorder",
+  "version": "0.2.5",
+  "action": {
+    "default_title": "VocMind",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "tabCapture",
+    "downloads",
+    "offscreen",
+    "storage",
+    "contextMenus"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "commands": {
+    "stop-recording": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+S",
+        "mac": "Command+Shift+S"
+      },
+      "description": "Остановить запись VocMind"
+    }
+  }
+}

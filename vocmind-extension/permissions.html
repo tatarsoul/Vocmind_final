@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Microphone permission</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; padding: 24px; }
+    .card { max-width: 520px; margin: 0 auto; padding: 18px 20px; border: 1px solid #ddd; border-radius: 12px; }
+    button { padding: 10px 14px; font-size: 14px; }
+    code { background: #f5f5f5; padding: 2px 6px; border-radius: 6px; }
+    .muted { color: #666; font-size: 13px; line-height: 1.4; }
+    .status { margin-top: 10px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Разрешение на микрофон</h2>
+    <p class="muted">
+      Chrome иногда “сбрасывает” запрос разрешения, если он запускается из popup расширения.
+      Нажми кнопку ниже — запрос пойдёт из обычной вкладки и должен корректно показать системный промпт.
+    </p>
+    <button id="grantBtn">Разрешить микрофон</button>
+    <div id="status" class="status muted"></div>
+    <p class="muted">После успешного разрешения вернись в popup и обнови список микрофонов.</p>
+  </div>
+  <script src="permissions.js"></script>
+</body>
+</html>
